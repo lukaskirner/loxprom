@@ -25,6 +25,8 @@ loxprom --host 192.168.1.5 --user prometheus \
 
 Use a dedicated read-only Miniserver user. After repeated failed logins Loxone locks the
 user, so the exporter waits 5 minutes after an authentication failure before retrying.
+The session token is refreshed (`getkey` + `refreshjwt`) after half its remaining
+lifetime, at least every 30 minutes, so the connection is not dropped when it expires.
 
 ## Metrics
 
