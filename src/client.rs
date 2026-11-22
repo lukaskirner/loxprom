@@ -3,14 +3,14 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::time::{interval, timeout};
+use tokio::time::{interval, sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, info, warn};
 
-use crate::auth::{self, LlResponse};
+use crate::auth::{self, HashAlg, LlResponse, Token};
 use crate::config::Config;
 use crate::protocol::{Framer, Incoming};
 use crate::store::Store;
@@ -37,6 +37,9 @@ pub struct Timings {
     pub keepalive: Duration,
     pub poll: Duration,
     pub idle: Duration,
+    /// Bounds for the delay until the next token refresh (half the remaining lifetime).
+    pub refresh_min: Duration,
+    pub refresh_max: Duration,
 }
 
 impl Timings {
@@ -45,6 +48,8 @@ impl Timings {
             keepalive: Duration::from_secs(30),
             poll: Duration::from_secs(cfg.structure_poll_secs),
             idle: Duration::from_secs(120),
+            refresh_min: Duration::from_secs(30),
+            refresh_max: Duration::from_secs(30 * 60),
         }
     }
 }
@@ -221,11 +226,20 @@ fn describe(m: &Incoming) -> String {
 }
 
 async fn send<S: AsyncRead + AsyncWrite + Unpin>(tx: &mut Tx<S>, cmd: &str) -> Result<()> {
-    debug!("-> {}", if cmd.starts_with("jdev/sys/getjwt") { "jdev/sys/getjwt/…" } else { cmd });
+    let shown = ["jdev/sys/getjwt", "jdev/sys/refreshjwt"].into_iter().find(|p| cmd.starts_with(p));
+    match shown {
+        Some(prefix) => debug!("-> {prefix}/…"),
+        None => debug!("-> {cmd}"),
+    }
     tx.send(Message::text(cmd)).await.context("send")
 }
 
-async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(rx: &mut Rx<S>, tx: &mut Tx<S>, cfg: &Config) -> Result<()> {
+/// Log in; returns the token and the hash algorithm the Miniserver asked for.
+async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
+    rx: &mut Rx<S>,
+    tx: &mut Tx<S>,
+    cfg: &Config,
+) -> Result<(Token, HashAlg)> {
     let user = auth::encode_segment(&cfg.user);
     send(tx, &format!("jdev/sys/getkey2/{user}")).await?;
     let r = rx.response("getkey2").await?;
@@ -241,7 +255,31 @@ async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(rx: &mut Rx<S>, tx: &mu
     if r.code != 200 {
         return Err(AuthError(format!("getjwt returned code {}", r.code)).into());
     }
-    Ok(())
+    let token = auth::parse_token(&r).context("parsing getjwt response")?;
+    Ok((token, key2.alg))
+}
+
+/// When to refresh a token: after half its remaining lifetime, clamped to the bounds in
+/// `timings`. `validUntil` counts from the Loxone epoch in the Miniserver's local time,
+/// so the clamp also absorbs a time zone offset.
+fn refresh_delay(valid_until: Option<u64>, now_unix: u64, timings: &Timings) -> Duration {
+    let half = match valid_until {
+        Some(v) => Duration::from_secs((v + auth::LOXONE_EPOCH).saturating_sub(now_unix) / 2),
+        None => timings.refresh_max,
+    };
+    half.clamp(timings.refresh_min, timings.refresh_max)
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Token refresh progress: `getkey` -> `refreshjwt`, driven by responses in the main loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refresh {
+    Idle,
+    AwaitKey,
+    AwaitToken,
 }
 
 /// Drive one connection until it fails. Always returns an error.
@@ -255,7 +293,8 @@ pub async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     let (mut tx, stream) = ws.split();
     let mut rx = Rx { stream, framer: Framer::default() };
 
-    timeout(STEP_TIMEOUT, authenticate(&mut rx, &mut tx, cfg)).await.context("authentication timed out")??;
+    let (mut token, hash_alg) =
+        timeout(STEP_TIMEOUT, authenticate(&mut rx, &mut tx, cfg)).await.context("authentication timed out")??;
     info!("authenticated as {}", cfg.user);
 
     send(&mut tx, "data/LoxAPP3.json").await?;
@@ -274,6 +313,13 @@ pub async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     keepalive.tick().await;
     poll.tick().await;
     let mut last_rx = Instant::now();
+    // Version reported by LoxAPPversion3 for which a reload is in flight. `known_version`
+    // only advances once the new structure has actually been parsed, so a lost or
+    // unparsable file is retried on the next poll.
+    let mut pending_version: Option<String> = None;
+    let mut refresh = Refresh::Idle;
+    let refresh_timer = sleep(refresh_delay(token.valid_until, now_unix(), &timings));
+    tokio::pin!(refresh_timer);
 
     loop {
         tokio::select! {
@@ -286,7 +332,7 @@ pub async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     Incoming::File(raw) => match structure::parse(&raw) {
                         Ok(s) => {
                             info!("structure reloaded: {} states", s.states.len());
-                            known_version = s.version.clone().or(known_version);
+                            known_version = s.version.clone().or(pending_version.take()).or(known_version);
                             store.set_structure(s);
                             // Ask for a full value dump so new controls are populated.
                             send(&mut tx, "jdev/sps/enablebinstatusupdate").await?;
@@ -295,13 +341,32 @@ pub async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     },
                     Incoming::Text(t) => {
                         let Ok(r) = auth::parse_ll(&t) else { continue };
-                        if r.control.contains("LoxAPPversion3") {
+                        let control = r.control.trim_end_matches('/');
+                        if control.contains("LoxAPPversion3") {
                             let Some(v) = r.value.as_str().map(str::to_string) else { continue };
                             if known_version.as_deref() != Some(v.as_str()) {
                                 info!("structure changed ({v}); reloading");
-                                known_version = Some(v);
+                                pending_version = Some(v);
                                 send(&mut tx, "data/LoxAPP3.json").await?;
                             }
+                        } else if control.ends_with("sys/getkey") && refresh == Refresh::AwaitKey {
+                            if r.code != 200 {
+                                bail!("token refresh: getkey returned code {}", r.code);
+                            }
+                            let key = auth::parse_key(&r).context("parsing getkey response")?;
+                            let hash = auth::token_hash(&token.token, &key, hash_alg);
+                            let user = auth::encode_segment(&cfg.user);
+                            send(&mut tx, &format!("jdev/sys/refreshjwt/{hash}/{user}")).await?;
+                            refresh = Refresh::AwaitToken;
+                        } else if control.contains("refreshjwt") && refresh == Refresh::AwaitToken {
+                            if r.code != 200 {
+                                bail!("token refresh: refreshjwt returned code {}", r.code);
+                            }
+                            token = auth::parse_token(&r).context("parsing refreshjwt response")?;
+                            let delay = refresh_delay(token.valid_until, now_unix(), &timings);
+                            info!("token refreshed; next refresh in {}s", delay.as_secs());
+                            refresh = Refresh::Idle;
+                            refresh_timer.as_mut().reset(tokio::time::Instant::now() + delay);
                         }
                     }
                     Incoming::Keepalive | Incoming::Ignored => {}
@@ -314,6 +379,14 @@ pub async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                 send(&mut tx, "keepalive").await?;
             }
             _ = poll.tick() => send(&mut tx, "jdev/sps/LoxAPPversion3").await?,
+            () = &mut refresh_timer => {
+                if refresh != Refresh::Idle {
+                    bail!("token refresh timed out");
+                }
+                send(&mut tx, "jdev/sys/getkey").await?;
+                refresh = Refresh::AwaitKey;
+                refresh_timer.as_mut().reset(tokio::time::Instant::now() + STEP_TIMEOUT);
+            }
         }
     }
 }
@@ -323,6 +396,7 @@ mod tests {
     use super::*;
     use crate::protocol::encode;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
     const A: &str = "aaaaaaaa-0000-0000-0000000000000001";
@@ -345,10 +419,22 @@ mod tests {
     }
 
     /// A tiny fake Miniserver speaking just enough of the protocol.
-    async fn fake_miniserver(listener: TcpListener, password: &'static str, current: Arc<Mutex<(String, String)>>) {
+    /// Tokens it issues expire one second after issue, so the client refreshes quickly;
+    /// `refreshes` counts accepted `refreshjwt` calls.
+    async fn fake_miniserver(
+        listener: TcpListener,
+        password: &'static str,
+        current: Arc<Mutex<(String, String)>>,
+        refreshes: Arc<AtomicUsize>,
+    ) {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
         let k2 = auth::Key2 { key: hex::decode(KEY).unwrap(), salt: "SALT123".into(), alg: auth::HashAlg::Sha256 };
+        let mut token = String::new();
+        let issue = |n: usize| {
+            let valid_until = now_unix() - auth::LOXONE_EPOCH + 1;
+            (format!("tok-{n}"), format!(r#"{{"token":"tok-{n}","validUntil":{valid_until},"tokenRights":1666,"unsecurePass":false}}"#))
+        };
         while let Some(Ok(msg)) = ws.next().await {
             let Message::Text(cmd) = msg else { continue };
             let cmd = cmd.to_string();
@@ -358,8 +444,23 @@ mod tests {
                 )).await;
             } else if let Some(rest) = cmd.strip_prefix("jdev/sys/getjwt/") {
                 let ok = rest.split('/').next() == Some(auth::auth_hash("prom", password, &k2).as_str());
-                let code = if ok { "200" } else { "401" };
-                reply_text(&mut ws, format!(r#"{{"LL":{{"control":"dev/sys/getjwt","value":"{{}}","Code":"{code}"}}}}"#)).await;
+                let (t, value) = issue(0);
+                let (code, value) = if ok { ("200", value) } else { ("401", "\"\"".to_string()) };
+                token = t;
+                reply_text(&mut ws, format!(r#"{{"LL":{{"control":"jdev/sys/getjwt/x","value":{value},"Code":"{code}"}}}}"#)).await;
+            } else if cmd == "jdev/sys/getkey" {
+                reply_text(&mut ws, format!(r#"{{"LL":{{"control":"dev/sys/getkey","value":"{KEY}","Code":"200"}}}}"#)).await;
+            } else if let Some(rest) = cmd.strip_prefix("jdev/sys/refreshjwt/") {
+                let expected = auth::token_hash(&token, &k2.key, k2.alg);
+                let (code, value) = if rest == format!("{expected}/prom") {
+                    let n = refreshes.fetch_add(1, Ordering::SeqCst) + 1;
+                    let (t, value) = issue(n);
+                    token = t;
+                    ("200", value)
+                } else {
+                    ("401", "\"\"".to_string())
+                };
+                reply_text(&mut ws, format!(r#"{{"LL":{{"control":"jdev/sys/refreshjwt/x/prom","value":{value},"Code":"{code}"}}}}"#)).await;
             } else if cmd == "data/LoxAPP3.json" {
                 let body = current.lock().unwrap().1.clone();
                 // As seen on a real Gen 2 Miniserver: two file headers, then the JSON
@@ -400,6 +501,8 @@ mod tests {
         keepalive: Duration::from_millis(100),
         poll: Duration::from_millis(100),
         idle: Duration::from_secs(5),
+        refresh_min: Duration::from_millis(100),
+        refresh_max: Duration::from_millis(200),
     };
 
     async fn wait_for(store: &Store, needle: &str) -> String {
@@ -419,7 +522,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let v1 = structure_json("2024-05-02 10:00:00", "Thermo", &[("temp", A), ("door", B)]);
         let current = Arc::new(Mutex::new(("2024-05-02 10:00:00".to_string(), v1)));
-        tokio::spawn(fake_miniserver(listener, "secret", current.clone()));
+        tokio::spawn(fake_miniserver(listener, "secret", current.clone(), Arc::default()));
 
         let store = Arc::new(Store::new());
         let cfg = test_config(port, "secret");
@@ -453,7 +556,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let current = Arc::new(Mutex::new((String::new(), "{}".to_string())));
-        tokio::spawn(fake_miniserver(listener, "secret", current));
+        tokio::spawn(fake_miniserver(listener, "secret", current, Arc::default()));
 
         let store = Store::new();
         let cfg = test_config(port, "wrong");
@@ -470,7 +573,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let v1 = structure_json("2024-05-02 10:00:00", "Thermo", &[("temp", A), ("door", B)]);
         let current = Arc::new(Mutex::new(("2024-05-02 10:00:00".to_string(), v1)));
-        let server = tokio::spawn(fake_miniserver(listener, "secret", current));
+        let server = tokio::spawn(fake_miniserver(listener, "secret", current, Arc::default()));
 
         let store = Arc::new(Store::new());
         let cfg = test_config(port, "secret");
@@ -487,5 +590,74 @@ mod tests {
         store.set_connected(false); // done by `run`
         let out = store.render();
         assert!(out.contains("loxone_connected 0\n") && out.contains("} 21.5\n"));
+    }
+
+    #[test]
+    fn refresh_delay_is_half_the_remaining_lifetime_within_bounds() {
+        let t = Timings::from_config(&test_config(1, "x"));
+        let now = auth::LOXONE_EPOCH + 1_000_000;
+        let at = |secs_left: u64| refresh_delay(Some(1_000_000 + secs_left), now, &t);
+        assert_eq!(at(3600), Duration::from_secs(1800));
+        assert_eq!(at(10), t.refresh_min);
+        assert_eq!(refresh_delay(Some(0), now, &t), t.refresh_min, "already expired");
+        assert_eq!(at(30 * 24 * 3600), t.refresh_max);
+        assert_eq!(refresh_delay(None, now, &t), t.refresh_max);
+    }
+
+    #[tokio::test]
+    async fn token_is_refreshed_repeatedly_with_the_latest_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let v1 = structure_json("2024-05-02 10:00:00", "Thermo", &[("temp", A)]);
+        let current = Arc::new(Mutex::new(("2024-05-02 10:00:00".to_string(), v1)));
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(fake_miniserver(listener, "secret", current, refreshes.clone()));
+
+        let store = Arc::new(Store::new());
+        let cfg = test_config(port, "secret");
+        let ws = connect_plain(port).await;
+        let s2 = store.clone();
+        let task = tokio::spawn(async move {
+            let mut est = false;
+            session(ws, &cfg, &s2, FAST, &mut est).await
+        });
+        // The fake rejects a refresh hashed with a stale token, which would end the session.
+        for _ in 0..100 {
+            if refreshes.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(refreshes.load(Ordering::SeqCst) >= 3, "too few refreshes");
+        assert!(!task.is_finished(), "session ended: {:?}", task.await);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn unparsable_structure_reload_is_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let v1 = structure_json("2024-05-02 10:00:00", "Thermo", &[("temp", A)]);
+        let current = Arc::new(Mutex::new(("2024-05-02 10:00:00".to_string(), v1)));
+        tokio::spawn(fake_miniserver(listener, "secret", current.clone(), Arc::default()));
+
+        let store = Arc::new(Store::new());
+        let cfg = test_config(port, "secret");
+        let ws = connect_plain(port).await;
+        let s2 = store.clone();
+        let task = tokio::spawn(async move {
+            let mut est = false;
+            session(ws, &cfg, &s2, FAST, &mut est).await
+        });
+        wait_for(&store, "loxone_value_thermo{").await;
+
+        // The version changes but the first download is garbage.
+        *current.lock().unwrap() = ("2024-05-02 11:00:00".to_string(), "not json".to_string());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(store.render().contains("loxone_value_thermo{"));
+        // Same version, now a valid file: the next poll must still pick it up.
+        current.lock().unwrap().1 = structure_json("2024-05-02 11:00:00", "Humidity", &[("hum", C)]);
+        wait_for(&store, "loxone_value_humidity{").await;
+        task.abort();
     }
 }
