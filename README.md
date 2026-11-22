@@ -53,6 +53,16 @@ While the connection is down the last values stay on `/metrics` and `loxone_conn
 Every `--structure-poll-secs` the exporter checks `LoxAPPversion3`; on a change it reloads
 the structure and series of removed controls disappear.
 
+## Docker
+
+Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GHCR by CI:
+`latest` from `main`, semver tags from `v*` git tags, plus `sha-<commit>`.
+
+```sh
+docker run -d -p 9876:9876 -e LOXONE_HOST=192.168.1.5 -e LOXONE_USER=prometheus \
+  -e LOXONE_PASSWORD=... ghcr.io/lukaskirner/loxprom:latest
+```
+
 ## Build
 
 ```sh
